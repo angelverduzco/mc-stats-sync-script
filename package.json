@@ -1,7 +1,7 @@
 {
 	"name": "mc-server-sync",
 	"version": "1.0.0",
-	"description": "",
+	"description": "Syncs Minecraft player statistics from the server's world/stats directory to an AWS S3 bucket as a consolidated JSON file.",
 	"homepage": "https://github.com/angelverduzco/mc-stats-sync-script#readme",
 	"repository": {
 		"type": "git",
