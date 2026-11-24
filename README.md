@@ -28,6 +28,26 @@ npm install --omit=dev
 
 NVM installs Node.js under `/home/ec2-user/.nvm/versions/node/`. Find the exact executable path for the installed version with `nvm which current` (for example, `/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node`). In the commands below, replace `vXX.XX.X` with the version directory installed on your instance.
 
+### Fix missing `libatomic` shared library
+
+If `node` or `npm` fails with the following error:
+
+```text
+ERROR: node: error while loading shared libraries: libatomic.so.1: cannot open shared object file: No such file or directory
+```
+
+Install the `libatomic` library with `dnf`:
+
+```bash
+sudo dnf install -y libatomic
+```
+
+On systems that use `yum`, install it with:
+
+```bash
+sudo yum install -y libatomic
+```
+
 The script uses these environment variables:
 
 | Variable | Purpose |
