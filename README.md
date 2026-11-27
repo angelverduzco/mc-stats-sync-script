@@ -1,148 +1,242 @@
-# Minecraft Server Stats Sync
+# EC2 Minecraft Scripts
 
-This script reads player statistics from a Minecraft server, combines them with player names from `usercache.json`, and uploads the result to an AWS S3 bucket as `stats.json`.
+A collection of scripts to install, maintain, and monitor a Minecraft Java server hosted on an AWS EC2 instance running **Amazon Linux 2023**.
 
-For each JSON file in `world/stats`, the script collects the player's UUID, name, play time in ticks, deaths, mob kills, and jumps. The uploaded JSON includes an `updatedAt` timestamp and a `players` array.
+## Scripts
+
+| Script | Purpose | Run as |
+| --- | --- | --- |
+| [`scripts/install-server.sh`](#install-the-server) | Installs Java 21 and a vanilla Minecraft server as a `systemd` service | `sudo` |
+| [`scripts/reset-world.sh`](#reset-the-world) | Backs up and regenerates the world, optionally with a given seed | `sudo` |
+| [`scripts/upgrade-mods.sh`](#upgrade-to-fabric-and-install-mods) | Converts the vanilla server to Fabric and downloads mods from Modrinth | `sudo` |
+| [`scripts/index.js`](#sync-player-stats-to-s3) | Uploads player statistics to an S3 bucket as `stats.json` | `ec2-user` (cron) |
 
 ## Requirements
 
-- An Amazon Linux 2023 EC2 instance with access to the Minecraft server files
-- Node.js and Git
-- An S3 bucket
-- AWS credentials available to the process. On EC2, the recommended option is an instance profile (IAM role) with permission to write `stats.json` to the bucket. Do not put AWS access keys in the script or crontab.
+- An Amazon Linux 2023 EC2 instance with `sudo` access. The server defaults to 3 GB of RAM (`-Xmx3G`), so use an instance with at least 4 GB.
+- A security group rule that allows inbound TCP traffic on port `25565`.
+- Git, to clone this repository.
+- For the stats sync only: Node.js, an S3 bucket, and an IAM role attached to the instance.
 
-## Configure and install on EC2
+## Getting started
 
-Install Node.js with [NVM, following AWS's instructions](https://docs.aws.amazon.com/es_es/sdk-for-javascript/v2/developer-guide/setting-up-node-on-ec2-instance.html), and install Git if needed. The Amazon Linux instructions install the latest LTS version of Node.js. Then clone the repository. The example uses `/home/ec2-user/mc-stats-sync` as the installation directory:
+Clone the repository on the instance:
+
+```bash
+sudo dnf install -y git
+cd /home/ec2-user
+git clone https://github.com/angelverduzco/ec2-minecraft-scripts.git
+cd ec2-minecraft-scripts
+```
+
+The shell scripts are executable, so run them directly (for example `sudo ./scripts/reset-world.sh`) instead of using `sudo bash <script>`. If a script is not executable after cloning, run `chmod +x scripts/*.sh`.
+
+Server layout used by the shell scripts:
+
+| Item | Value |
+| --- | --- |
+| Server directory | `/opt/minecraft/server` |
+| Backups directory | `/opt/minecraft/backups` |
+| System user | `minecraft` |
+| Service | `minecraft.service` |
+
+## Install the server
+
+`scripts/install-server.sh` installs Amazon Corretto 21, creates the `minecraft` user, downloads the server jar, accepts the EULA, and registers and starts the `minecraft` service so it also starts on boot.
+
+1. Open `scripts/install-server.sh` and set `MINECRAFTSERVERURL` to the server jar URL for the version you want (from the [official Minecraft download page](https://www.minecraft.net/en-us/download/server)). Do not add spaces around the `=`.
+2. Run it:
+
+   ```bash
+   sudo ./scripts/install-server.sh
+   ```
+
+   The script waits about 40 seconds while the server generates its files, so it takes a minute to finish.
+
+By running it you accept the [Minecraft EULA](https://aka.ms/MinecraftEULA).
+
+Useful commands once the server is installed:
+
+```bash
+sudo systemctl status minecraft      # service status
+sudo systemctl restart minecraft     # restart the server
+sudo journalctl -u minecraft -f      # follow the server log
+```
+
+## Reset the world
+
+`scripts/reset-world.sh` stops the server, saves a compressed backup of the current world to `/opt/minecraft/backups`, deletes it, sets the seed in `server.properties`, and starts the server again so it generates a new world.
+
+```bash
+sudo ./scripts/reset-world.sh                          # new world with a random seed
+sudo ./scripts/reset-world.sh 123456789                # new world with a specific seed
+sudo ./scripts/reset-world.sh "-4172144997902289642"   # quote negative seeds
+sudo ./scripts/reset-world.sh --same-seed              # new world reusing the current seed (alias: -s)
+```
+
+| Option | Description |
+| --- | --- |
+| *(none)* | Generates the new world with a random seed. |
+| `SEED` | Uses the given seed. Quote negative seeds. |
+| `-s`, `--same-seed` | Regenerates the world reusing the current world's seed. Cannot be combined with `SEED`. |
+| `-h`, `--help` | Prints the usage message and exits. |
+
+The seed may only contain letters, digits, spaces, hyphens, and underscores; any other character is removed. The backup is named `<level-name>_<YYYYMMDD_HHMMSS>.tar.gz`.
+
+### Reuse the current seed
+
+Use `--same-seed` to get a fresh world (new chunks, no player-made changes) with the same terrain as the current one:
+
+```bash
+sudo ./scripts/reset-world.sh --same-seed
+```
+
+The script finds the current seed before stopping the server:
+
+1. It reads `level-seed=` from `server.properties`.
+2. If that value is empty (the world was created with a random seed), it reads the seed from `<level-name>/level.dat` using `python3`.
+
+It then prints `>> Reusing current seed: <seed>`, backs up and deletes the world, writes the seed to `server.properties`, and restarts the server. If the seed cannot be determined, the script exits with an error **without stopping the server or touching the world**. In that case, run `/seed` in game and pass it explicitly:
+
+```bash
+sudo ./scripts/reset-world.sh "<seed>"
+```
+
+After the server starts, run `/seed` in game to confirm it matches the previous one. Note that the seed stays set in `server.properties`, so later resets without arguments will overwrite it with an empty value (random seed).
+
+## Upgrade to Fabric and install mods
+
+`scripts/upgrade-mods.sh` converts an already installed vanilla server to [Fabric](https://fabricmc.net/) and downloads the mods listed in the script, plus their required dependencies, from [Modrinth](https://modrinth.com/). The Fabric jar replaces `server.jar`, so the `start` script and the `systemd` service do not change. The original jar is kept as `server.vanilla.jar.bak`.
+
+Edit the configuration block at the top of the script before running it:
+
+| Variable | Purpose |
+| --- | --- |
+| `MC_VERSION` | Minecraft version to use. It must match your current world unless you wipe it. |
+| `SEED` | New world seed. Leave empty to keep the current one. |
+| `WIPE_WORLD` | `"yes"` backs up and deletes the world (needed for a new seed or terrain mods). Default is `"no"`. |
+| `MODS` | List of mod names to look up on Modrinth. Mods without a Fabric build for `MC_VERSION` are skipped with a warning. |
+
+```bash
+sudo ./scripts/upgrade-mods.sh
+```
+
+Clients need the same mods and the Fabric loader to join a modded server. Back up the world before running this script, and review the output for skipped mods.
+
+## Sync player stats to S3
+
+`scripts/index.js` reads the player statistics from the server, combines them with the player names in `usercache.json`, and uploads the result to an S3 bucket as `stats.json`.
+
+For each JSON file in `<MC_DIR>/world/stats`, it collects every stat category and metric (with the `minecraft:` prefix removed). The uploaded JSON has this shape:
+
+```json
+{
+  "updatedAt": "2026-01-01T12:00:00.000Z",
+  "availableStats": { "custom": ["deaths", "jump", "play_time"] },
+  "players": [
+    { "uuid": "00000000-0000-0000-0000-000000000000", "name": "Steve", "stats": { "custom": { "deaths": 3 } } }
+  ]
+}
+```
+
+Players missing from `usercache.json` are named `Unknown`.
+
+### Install Node.js and dependencies
+
+Install Node.js with [NVM, following AWS's instructions](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-up-node-on-ec2-instance.html), then install the dependencies from the repository directory:
 
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 source ~/.bashrc
 nvm install --lts
-sudo dnf install -y git
-cd /home/ec2-user
-git clone https://github.com/angelverduzco/mc-stats-sync-script.git mc-stats-sync
-cd /home/ec2-user/mc-stats-sync
+cd /home/ec2-user/ec2-minecraft-scripts
 npm install --omit=dev
 ```
 
-NVM installs Node.js under `/home/ec2-user/.nvm/versions/node/`. Find the exact executable path for the installed version with `nvm which current` (for example, `/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node`). In the commands below, replace `vXX.XX.X` with the version directory installed on your instance.
+NVM installs Node.js under `/home/ec2-user/.nvm/versions/node/`. Find the exact executable with `nvm which current` (for example `/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node`). In the commands below, replace `vXX.XX.X` with the version installed on your instance.
 
-### Fix missing `libatomic` shared library
-
-If `node` or `npm` fails with the following error:
-
-```text
-ERROR: node: error while loading shared libraries: libatomic.so.1: cannot open shared object file: No such file or directory
-```
-
-Install the `libatomic` library with `dnf`:
+If `node` or `npm` fails with `error while loading shared libraries: libatomic.so.1`, install the missing library:
 
 ```bash
 sudo dnf install -y libatomic
 ```
 
-On systems that use `yum`, install it with:
-
-```bash
-sudo yum install -y libatomic
-```
+### Configure
 
 The script uses these environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `MC_DIR` | Minecraft server directory containing `usercache.json` and `world/stats` |
+| `MC_DIR` | Minecraft server directory containing `usercache.json` and `world/stats` (for example `/opt/minecraft/server`) |
 | `S3_BUCKET` | Name of the destination S3 bucket |
-| `AWS_REGION` | AWS region for the S3 bucket |
+| `AWS_REGION` | AWS region of the S3 bucket |
 
-Set `MC_DIR` to the actual server directory. For example, if `usercache.json` is at `/home/ec2-user/minecraft/usercache.json`, use `/home/ec2-user/minecraft`. The script reads statistics from `<MC_DIR>/world/stats`.
+Attach an IAM role to the instance that allows `s3:PutObject` on `arn:aws:s3:::YOUR_BUCKET_NAME/stats.json`. The AWS SDK uses the instance role automatically. **Never put AWS access keys in the script, a `.env` file, or the crontab.**
 
-Ensure the EC2 instance's IAM role allows `s3:PutObject` for `arn:aws:s3:::YOUR_BUCKET_NAME/stats.json`. The AWS SDK uses the instance role automatically; no credentials need to be added to the command.
-
-### Use a `.env` file
-
-You can keep these settings in a `.env` file in the project directory. Node.js 20.6.0 and later can load it with the `--env-file` option; for older versions, source the file in the shell before starting Node.js. Do not put AWS access keys in this file.
-
-Create `/home/ec2-user/mc-stats-sync/.env` with your configuration:
+Keep the settings in a `.env` file based on `.env.template`:
 
 ```bash
-MC_DIR="/home/ec2-user/minecraft"
-S3_BUCKET="YOUR_BUCKET_NAME"
-AWS_REGION="us-east-2"
+cd /home/ec2-user/ec2-minecraft-scripts
+cp .env.template .env
+nano .env
 ```
 
-With Node.js 20.6.0 or later, run the script manually with:
+### Run once manually
+
+With Node.js 20.6.0 or later:
 
 ```bash
-/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node --env-file=/home/ec2-user/mc-stats-sync/.env /home/ec2-user/mc-stats-sync/index.js
+/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node \
+  --env-file=/home/ec2-user/ec2-minecraft-scripts/.env \
+  /home/ec2-user/ec2-minecraft-scripts/scripts/index.js
 ```
 
-For older Node.js versions, load the variables from the shell first:
+With an older version, load the variables from the shell first:
 
 ```bash
-cd /home/ec2-user/mc-stats-sync
-set -a
-. ./.env
-set +a
-/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node ./index.js
+cd /home/ec2-user/ec2-minecraft-scripts
+set -a; . ./.env; set +a
+/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node ./scripts/index.js
 ```
 
-## Run once manually
+On success, `stats.json` is uploaded or replaced at the root of the bucket. Errors are printed to the output and the script exits with a non-zero code.
 
-Alternatively, set the variables inline to verify the paths, bucket, and AWS permissions:
+### Run automatically with cron
 
-```bash
-S3_BUCKET="YOUR_BUCKET_NAME" \
-MC_DIR="/home/ec2-user/minecraft" \
-AWS_REGION="us-east-2" \
-/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node /home/ec2-user/mc-stats-sync/index.js
-```
-
-Replace the example bucket, server directory, region, and Node.js version directory as needed. On success, the script uploads or replaces `stats.json` at the root of the bucket. Errors are written to the command output and cause a non-zero exit.
-
-## Run automatically with cron
-
-To sync every 15 minutes, edit the `ec2-user` crontab:
-
-```bash
-crontab -e
-```
-
-Add a line like this, adjusting the bucket, server directory, region, Node.js path, and repository path to match your instance:
+Open the `ec2-user` crontab with `crontab -e` and add a line like this to sync every 15 minutes:
 
 ```cron
-*/15 * * * * S3_BUCKET="YOUR_BUCKET_NAME" MC_DIR="/home/ec2-user/minecraft" AWS_REGION="us-east-2" /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node /home/ec2-user/mc-stats-sync/index.js >> /home/ec2-user/mc-stats-sync/sync.log 2>&1
+*/15 * * * * /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node --env-file=/home/ec2-user/ec2-minecraft-scripts/.env /home/ec2-user/ec2-minecraft-scripts/scripts/index.js >> /home/ec2-user/ec2-minecraft-scripts/sync.log 2>&1
 ```
 
-For Node.js 20.6.0 or later, use the built-in `--env-file` option:
+For Node.js older than 20.6.0, source the `.env` file in the command instead:
 
 ```cron
-*/15 * * * * /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node --env-file=/home/ec2-user/mc-stats-sync/.env /home/ec2-user/mc-stats-sync/index.js >> /home/ec2-user/mc-stats-sync/sync.log 2>&1
+*/15 * * * * set -a; . /home/ec2-user/ec2-minecraft-scripts/.env && set +a && /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node /home/ec2-user/ec2-minecraft-scripts/scripts/index.js >> /home/ec2-user/ec2-minecraft-scripts/sync.log 2>&1
 ```
 
-Check the installed version with `/home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node --version`. For older Node.js versions, source the `.env` file in the cron command instead:
-
-```cron
-*/15 * * * * set -a; . /home/ec2-user/mc-stats-sync/.env && set +a && /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node /home/ec2-user/mc-stats-sync/index.js >> /home/ec2-user/mc-stats-sync/sync.log 2>&1
-```
-
-Cron runs with a limited environment, so use absolute paths for Node.js, the script, the `.env` file, and the log file. Replace `vXX.XX.X` in the crontab examples with the installed NVM version directory. On Amazon Linux 2023, the cron service is `crond`; if it is not already enabled, start it with:
+Cron runs with a limited environment, so use absolute paths everywhere. The script runs once and exits; check `sync.log` if a scheduled run fails. On Amazon Linux 2023, make sure the cron service is running:
 
 ```bash
 sudo systemctl enable --now crond
 ```
 
-The script runs once and exits; cron starts a new run at each scheduled interval. Check `sync.log` if a scheduled run fails.
-
-## Update the script
-
-After making and pushing changes to the repository, update the EC2 checkout:
+## Updating the scripts
 
 ```bash
-cd /home/ec2-user/mc-stats-sync
+cd /home/ec2-user/ec2-minecraft-scripts
 git pull
 npm install --omit=dev
 ```
 
-The next cron run uses the updated code. No Minecraft server restart is required.
+The next cron run uses the updated stats script. No Minecraft server restart is required.
+
+## Safety notes
+
+- `reset-world.sh` and `upgrade-mods.sh` (with `WIPE_WORLD="yes"`) delete the current world. Both save a backup first, but confirm it exists before relying on it, and keep copies off the instance (for example in S3).
+- Try changes on a throwaway instance or a copy of the world before running them on the production server.
+- Only download server jars and mods from official sources over HTTPS.
+
+## Contributing
+
+Project conventions and best practices are described in [`CLAUDE.md`](CLAUDE.md). All files must be written in English, and this README should be updated whenever a script's behavior or configuration changes.

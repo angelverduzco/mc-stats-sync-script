@@ -1,14 +1,46 @@
 #!/bin/bash
 # Resets the Minecraft server world (backs up the current one and generates a new one).
 # Usage:
-#   sudo ./reset-world.sh            -> new world with a random seed
-#   sudo ./reset-world.sh 123456789  -> new world with that seed
+#   sudo ./reset-world.sh                 -> new world with a random seed
+#   sudo ./reset-world.sh 123456789       -> new world with that seed
 #   sudo ./reset-world.sh "-4172144997902289642"  (quote negative seeds)
+#   sudo ./reset-world.sh --same-seed     -> new world reusing the current seed (alias: -s)
 
 set -u
 SERVER_DIR=/opt/minecraft/server
 BACKUP_DIR=/opt/minecraft/backups
-SEED="${1:-}"
+
+usage() {
+  cat <<'EOF'
+Usage: sudo ./reset-world.sh [--same-seed | SEED]
+  (no args)        new world with a random seed
+  SEED             new world with the given seed (quote negative seeds)
+  -s, --same-seed  new world reusing the current world's seed
+  -h, --help       show this help
+EOF
+}
+
+SEED=""
+SAME_SEED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -s|--same-seed) SAME_SEED=1 ;;
+    *)
+      # Negative numeric seeds start with "-", so only reject non-numeric dash arguments
+      if [[ "$1" == -* && ! "$1" =~ ^-[0-9]+$ ]]; then
+        echo "Unknown option: $1"; usage; exit 1
+      fi
+      if [ -n "$SEED" ]; then echo "Only one seed can be given"; usage; exit 1; fi
+      SEED="$1"
+      ;;
+  esac
+  shift
+done
+
+if [ "$SAME_SEED" -eq 1 ] && [ -n "$SEED" ]; then
+  echo "--same-seed cannot be combined with an explicit seed"; usage; exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then echo "Run with sudo"; exit 1; fi
 cd "$SERVER_DIR" || exit 1
@@ -16,6 +48,29 @@ cd "$SERVER_DIR" || exit 1
 # World folder name (defaults to "world")
 LEVEL_NAME=$(grep -m1 '^level-name=' server.properties | cut -d= -f2-)
 LEVEL_NAME=${LEVEL_NAME:-world}
+
+# Reuse the current seed (resolved before touching the server or the world)
+if [ "$SAME_SEED" -eq 1 ]; then
+  # 1) Explicit seed in server.properties
+  SEED=$(grep -m1 '^level-seed=' server.properties | cut -d= -f2-)
+  # 2) Random seed: read it from level.dat (NBT long tag "seed")
+  if [ -z "$SEED" ] && [ -f "$LEVEL_NAME/level.dat" ] && command -v python3 >/dev/null 2>&1; then
+    SEED=$(python3 - "$LEVEL_NAME/level.dat" <<'EOF' 2>/dev/null
+import gzip, struct, sys
+data = gzip.open(sys.argv[1]).read()
+i = data.find(b'\x04\x00\x04seed')
+if i != -1:
+    print(struct.unpack('>q', data[i + 7:i + 15])[0])
+EOF
+)
+  fi
+  if [ -z "$SEED" ]; then
+    echo "Could not determine the current seed."
+    echo "Run /seed in game and pass it explicitly: sudo ./reset-world.sh \"<seed>\""
+    exit 1
+  fi
+  echo ">> Reusing current seed: $SEED"
+fi
 
 # Sanitize the seed: only letters, digits, spaces, hyphen and underscore
 SEED=$(printf '%s' "$SEED" | tr -cd 'A-Za-z0-9 _-')
