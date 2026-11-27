@@ -15,6 +15,7 @@ A collection of scripts that automate actions on a Minecraft Java server. The ta
 - `scripts/install-server.sh`: Installs Corretto 21, downloads the server jar, creates the `minecraft` user, and sets up the `minecraft.service` systemd unit.
 - `scripts/reset-world.sh`: Stops the server, backs up the world to `/opt/minecraft/backups`, deletes it, optionally sets a seed, and restarts.
 - `scripts/upgrade-mods.sh`: Mod upgrade automation.
+- `scripts/auto-shutdown.sh`: Run from root's cron (every 10 min). After `MAX_CHECKS` (3) consecutive checks with no connections on port 25565 (30 min), stops `minecraft.service` and powers off the instance. Installed to `/usr/local/bin/mc-auto-shutdown.sh`.
 - `README.md`: Setup and usage instructions for the stats sync (EC2, NVM, cron, IAM).
 
 Server conventions used by the shell scripts: server files live in `/opt/minecraft/server`, run as user `minecraft`, managed through the `minecraft` systemd service.

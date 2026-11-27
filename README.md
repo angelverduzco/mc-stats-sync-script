@@ -9,6 +9,7 @@ A collection of scripts to install, maintain, and monitor a Minecraft Java serve
 | [`scripts/install-server.sh`](#install-the-server) | Installs Java 21 and a vanilla Minecraft server as a `systemd` service | `sudo` |
 | [`scripts/reset-world.sh`](#reset-the-world) | Backs up and regenerates the world, optionally with a given seed | `sudo` |
 | [`scripts/upgrade-mods.sh`](#upgrade-to-fabric-and-install-mods) | Converts the vanilla server to Fabric and downloads mods from Modrinth | `sudo` |
+| [`scripts/auto-shutdown.sh`](#auto-shutdown-when-the-server-is-idle) | Stops the server and powers off the instance after 30 minutes without players | `root` (cron) |
 | [`scripts/index.js`](#sync-player-stats-to-s3) | Uploads player statistics to an S3 bucket as `stats.json` | `ec2-user` (cron) |
 
 ## Requirements
@@ -123,6 +124,90 @@ sudo ./scripts/upgrade-mods.sh
 
 Clients need the same mods and the Fabric loader to join a modded server. Back up the world before running this script, and review the output for skipped mods.
 
+## Auto-shutdown when the server is idle
+
+An EC2 instance is billed for compute while it is `running`, even if nobody is playing. `scripts/auto-shutdown.sh` checks every 10 minutes for established TCP connections on port `25565`. After 3 consecutive checks with no players (30 minutes), it stops `minecraft.service` gracefully so the world is saved, and then powers off the instance (`shutdown -h now`). The instance ends in the `stopped` state. Start it again from the EC2 console when you want to play.
+
+### Requirements
+
+- `cron`. Amazon Linux 2023 does not include it by default:
+
+  ```bash
+  sudo dnf install -y cronie
+  sudo systemctl enable --now crond
+  sudo systemctl status crond
+  ```
+
+- The `ss` command (from `iproute`), which is preinstalled on Amazon Linux 2023.
+- Root privileges: the script runs from root's crontab because it stops a service and powers off the machine.
+
+### Install
+
+Copy the script to `/usr/local/bin` with root-only permissions:
+
+```bash
+cd /home/ec2-user/ec2-minecraft-scripts
+sudo install -m 700 -o root -g root scripts/auto-shutdown.sh /usr/local/bin/mc-auto-shutdown.sh
+```
+
+Schedule it in root's crontab. Run `sudo crontab -e` and add this line (in `vi`, press `i` to insert, then `Esc`, `:wq`, `Enter` to save):
+
+```cron
+*/10 * * * * /usr/local/bin/mc-auto-shutdown.sh
+```
+
+Or add it without opening an editor (safe to run more than once):
+
+```bash
+(sudo crontab -l 2>/dev/null | grep -v mc-auto-shutdown; echo '*/10 * * * * /usr/local/bin/mc-auto-shutdown.sh') | sudo crontab -
+```
+
+Verify the job is registered:
+
+```bash
+sudo crontab -l
+```
+
+### Configure
+
+The variables are at the top of the script. After editing `scripts/auto-shutdown.sh`, install it again with the `install` command above.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `25565` | Minecraft server port to monitor |
+| `SERVICE_NAME` | `minecraft.service` | Service stopped before powering off |
+| `COUNTER_FILE` | `/tmp/mc_idle_count` | Idle check counter (in `/tmp`, so it resets on reboot) |
+| `MAX_CHECKS` | `3` | Consecutive idle checks before shutting down |
+| `CHECK_INTERVAL_MIN` | `10` | Cron interval in minutes (only used in the log message) |
+
+The idle time before shutdown is `MAX_CHECKS` × the cron interval. If you change the schedule (for example to `*/5 * * * *`), update `CHECK_INTERVAL_MIN` to match and adjust `MAX_CHECKS` to get the timeout you want.
+
+### Test it
+
+Before relying on the 30-minute timer, try a 2-minute version:
+
+1. Edit the script to set `MAX_CHECKS=2` and `CHECK_INTERVAL_MIN=1`, install it again, and change the cron schedule to `* * * * *`.
+2. Make sure nobody is connected, then watch the counter:
+
+   ```bash
+   watch -n 5 "cat /tmp/mc_idle_count 2>/dev/null || echo 'Waiting for the first check...'"
+   ```
+
+3. After about 2 minutes the counter reaches `2`, the server stops, your SSH session disconnects, and the instance goes from `running` to `stopped` in the EC2 console.
+4. Start the instance, **connect via SSH within 2 minutes** (or the test timer shuts it down again), and restore `MAX_CHECKS=3`, `CHECK_INTERVAL_MIN=10`, and `*/10 * * * *`.
+
+To confirm a shutdown was triggered by the script, search the system log:
+
+```bash
+sudo journalctl | grep "Minecraft Auto-Shutdown"
+```
+
+### Notes
+
+- The public IPv4 address changes every time the instance is stopped and started, unless you attach an [Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html).
+- The idle timer starts counting as soon as the cron job runs. After starting the instance, connect before the idle checks add up to the timeout, or the instance shuts down again.
+- To disable the feature temporarily, remove the line from root's crontab (`sudo crontab -e`).
+
 ## Sync player stats to S3
 
 `scripts/index.js` reads the player statistics from the server, combines them with the player names in `usercache.json`, and uploads the result to an S3 bucket as `stats.json`.
@@ -234,6 +319,7 @@ The next cron run uses the updated stats script. No Minecraft server restart is 
 ## Safety notes
 
 - `reset-world.sh` and `upgrade-mods.sh` (with `WIPE_WORLD="yes"`) delete the current world. Both save a backup first, but confirm it exists before relying on it, and keep copies off the instance (for example in S3).
+- `auto-shutdown.sh` powers off the machine. Do not run it by hand while you are working on the server, and remove its cron entry if you need the instance to stay up (for example during maintenance).
 - Try changes on a throwaway instance or a copy of the world before running them on the production server.
 - Only download server jars and mods from official sources over HTTPS.
 
