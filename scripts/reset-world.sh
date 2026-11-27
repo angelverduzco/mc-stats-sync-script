@@ -1,9 +1,9 @@
 #!/bin/bash
 # Resets the Minecraft server world (backs up the current one and generates a new one).
 # Usage:
-#   sudo bash minecraft-reset-world.sh            -> new world with a random seed
-#   sudo bash minecraft-reset-world.sh 123456789  -> new world with that seed
-#   sudo bash minecraft-reset-world.sh "-4172144997902289642"  (quote negative seeds)
+#   sudo ./reset-world.sh            -> new world with a random seed
+#   sudo ./reset-world.sh 123456789  -> new world with that seed
+#   sudo ./reset-world.sh "-4172144997902289642"  (quote negative seeds)
 
 set -u
 SERVER_DIR=/opt/minecraft/server

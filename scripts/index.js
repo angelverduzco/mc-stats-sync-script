@@ -8,7 +8,7 @@ const REGION = process.env.AWS_REGION || 'us-east-2';
 
 const s3 = new S3Client({ region: REGION });
 
-// Limpia prefijos como "minecraft:diamond_ore" -> "diamond_ore" (conserva namespace si es de un mod)
+// Strips prefixes like "minecraft:diamond_ore" -> "diamond_ore" (keeps the namespace for modded keys)
 function cleanKey(key) {
   return key.startsWith('minecraft:') ? key.replace('minecraft:', '') : key;
 }
@@ -23,7 +23,7 @@ async function syncStats() {
     const files = await fs.readdir(statsDir);
 
     const playersData = [];
-    // Registro dinámico de todas las categorías y métricas que vayan apareciendo
+    // Dynamic registry of every category and metric found along the way
     const catalog = {};
 
     for (const file of files) {
@@ -36,7 +36,7 @@ async function syncStats() {
 
       const normalizedStats = {};
 
-      // Recorre dinámicamente cada categoría y cada estadística dentro de ella
+      // Dynamically walk every category and every stat inside it
       for (const [rawCategory, metrics] of Object.entries(rawCategories)) {
         const category = cleanKey(rawCategory);
         normalizedStats[category] = {};
@@ -54,19 +54,19 @@ async function syncStats() {
 
       playersData.push({
         uuid,
-        name: uuidToName[uuid] || 'Desconocido',
+        name: uuidToName[uuid] || 'Unknown',
         stats: normalizedStats
       });
     }
 
-    // Convertir los Sets del catálogo a Arrays ordenados para el JSON
+    // Convert the catalog Sets to sorted Arrays for the JSON output
     const availableStats = Object.fromEntries(
       Object.entries(catalog).map(([cat, set]) => [cat, Array.from(set).sort()])
     );
 
     const payload = {
       updatedAt: new Date().toISOString(),
-      availableStats, // Lista maestra de todas las stats descubiertas hasta hoy
+      availableStats, // Master list of every stat discovered so far
       players: playersData
     };
 
@@ -79,9 +79,9 @@ async function syncStats() {
     });
 
     await s3.send(command);
-    console.log(`[${new Date().toISOString()}] Estadísticas completas subidas correctamente.`);
+    console.log(`[${new Date().toISOString()}] Full stats uploaded successfully.`);
   } catch (error) {
-    console.error('Error sincronizando estadísticas:', error);
+    console.error('Error syncing stats:', error);
     process.exit(1);
   }
 }

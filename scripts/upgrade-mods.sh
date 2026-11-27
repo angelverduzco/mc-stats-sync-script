@@ -1,11 +1,11 @@
 #!/bin/bash
-# Convierte un servidor vanilla ya instalado (/opt/minecraft/server) a Fabric + mods.
-# Uso:  sudo bash minecraft-fabric-upgrade.sh
+# Converts an already installed vanilla server (/opt/minecraft/server) to Fabric + mods.
+# Usage:  sudo ./upgrade-mods.sh
 
-# ============================ CONFIGURACION ============================
-MC_VERSION="1.21.1"      # Debe ser la version de tu mundo actual (o la que quieras si vas a borrarlo)
-SEED=""                  # Vacia = no tocar la seed actual
-WIPE_WORLD="no"          # "yes" = respalda y borra el mundo (necesario para seed nueva / terreno de Tectonic)
+# ============================ CONFIGURATION ============================
+MC_VERSION="1.21.1"      # Must match your current world's version (or the one you want if you are going to wipe it)
+SEED=""                  # Empty = leave the current seed untouched
+WIPE_WORLD="no"          # "yes" = back up and delete the world (required for a new seed / Tectonic terrain)
 
 MODS=(
   "Tectonic"
@@ -24,28 +24,28 @@ SERVER_DIR=/opt/minecraft/server
 MODS_DIR=$SERVER_DIR/mods
 UA="minecraft-ec2-upgrade-script"
 
-if [ "$(id -u)" -ne 0 ]; then echo "Ejecuta con sudo"; exit 1; fi
+if [ "$(id -u)" -ne 0 ]; then echo "Run with sudo"; exit 1; fi
 
 yum install -y jq wget curl
 
-echo ">> Deteniendo el servidor"
+echo ">> Stopping the server"
 systemctl stop minecraft
 
 cd "$SERVER_DIR" || exit 1
 
-# Respaldo del mundo y del jar vanilla
+# Back up the world and the vanilla jar
 if [ "$WIPE_WORLD" = "yes" ]; then
-  echo ">> Respaldando y borrando el mundo"
+  echo ">> Backing up and deleting the world"
   tar czf "/opt/minecraft/world_backup_$(date +%Y%m%d_%H%M%S).tar.gz" world* 2>/dev/null
   rm -rf world world_nether world_the_end
 fi
 mv -f server.jar server.vanilla.jar.bak
 
-# Servidor de Fabric como server.jar (start y systemd no cambian)
+# Fabric server as server.jar (start and systemd stay unchanged)
 LOADER_VERSION=$(curl -s https://meta.fabricmc.net/v2/versions/loader | jq -r 'map(select(.stable))[0].version')
 INSTALLER_VERSION=$(curl -s https://meta.fabricmc.net/v2/versions/installer | jq -r 'map(select(.stable))[0].version')
 wget -O server.jar "https://meta.fabricmc.net/v2/versions/loader/${MC_VERSION}/${LOADER_VERSION}/${INSTALLER_VERSION}/server/jar" \
-  || { echo "Fallo la descarga de Fabric; restaurando jar vanilla"; mv -f server.vanilla.jar.bak server.jar; systemctl start minecraft; exit 1; }
+  || { echo "Fabric download failed; restoring vanilla jar"; mv -f server.vanilla.jar.bak server.jar; systemctl start minecraft; exit 1; }
 
 # Seed
 if [ -n "$SEED" ]; then
@@ -66,12 +66,12 @@ download_project() {
         --data-urlencode 'loaders=["fabric"]' \
         | jq 'map(select(.version_type=="release"))[0] // .[0]')
   if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-    echo "AVISO: '${label}' no tiene version para Fabric ${MC_VERSION}. Se omite."
+    echo "WARNING: '${label}' has no version for Fabric ${MC_VERSION}. Skipping."
     return
   fi
   local url
   url=$(echo "$ver" | jq -r '.files | (map(select(.primary))[0] // .[0]) | .url')
-  echo "Descargando ${label}: ${url##*/}"
+  echo "Downloading ${label}: ${url##*/}"
   wget -q -P "$MODS_DIR" "$url"
   local dep
   for dep in $(echo "$ver" | jq -r '.dependencies[] | select(.dependency_type=="required") | .project_id // empty'); do
@@ -88,7 +88,7 @@ download_by_name() {
         | jq -r --arg n "$name" '([.hits[] | select(.title | ascii_downcase == ($n | ascii_downcase))][0]
                                   // [.hits[] | select(.title | ascii_downcase | startswith($n | ascii_downcase))][0]).project_id // empty')
   if [ -z "$pid" ]; then
-    echo "AVISO: no encontre '${name}' en Modrinth. Se omite."
+    echo "WARNING: could not find '${name}' on Modrinth. Skipping."
     return
   fi
   download_project "$pid" "$name"
@@ -101,6 +101,6 @@ done
 
 chown -R minecraft:minecraft /opt/minecraft/
 
-echo ">> Iniciando el servidor"
+echo ">> Starting the server"
 systemctl start minecraft
-echo "Listo. Revisa el arranque con: sudo journalctl -u minecraft -f"
+echo "Done. Check the startup with: sudo journalctl -u minecraft -f"
