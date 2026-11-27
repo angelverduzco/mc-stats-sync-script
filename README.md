@@ -105,6 +105,10 @@ sudo ./scripts/reset-world.sh "<seed>"
 
 After the server starts, run `/seed` in game to confirm it matches the previous one. Note that the seed stays set in `server.properties`, so later resets without arguments will overwrite it with an empty value (random seed).
 
+### Effect on player stats
+
+The reset deletes `world/stats`, which is where the stats sync reads from. On its next run, the sync overwrites `stats.json` in S3 with the players of the new world only, so the previous history disappears from anything that reads that file. The backup in `/opt/minecraft/backups` still contains the old stats files, so copy `stats.json` from the bucket first if you want to keep it.
+
 ## Upgrade to Fabric and install mods
 
 `scripts/upgrade-mods.sh` converts an already installed vanilla server to [Fabric](https://fabricmc.net/) and downloads the mods listed in the script, plus their required dependencies, from [Modrinth](https://modrinth.com/). The Fabric jar replaces `server.jar`, so the `start` script and the `systemd` service do not change. The original jar is kept as `server.vanilla.jar.bak`.
@@ -207,6 +211,7 @@ sudo journalctl | grep "Minecraft Auto-Shutdown"
 - The public IPv4 address changes every time the instance is stopped and started, unless you attach an [Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html).
 - The idle timer starts counting as soon as the cron job runs. After starting the instance, connect before the idle checks add up to the timeout, or the instance shuts down again.
 - To disable the feature temporarily, remove the line from root's crontab (`sudo crontab -e`).
+- While the instance is stopped, the [stats sync](#sync-player-stats-to-s3) does not run, so `stats.json` stays as it was at the last sync. Stats from the last minutes before a shutdown (up to one sync interval) are uploaded by the first sync after the instance starts again.
 
 ## Sync player stats to S3
 
@@ -268,7 +273,18 @@ nano .env
 
 ### Run once manually
 
-With Node.js 20.6.0 or later:
+> `vXX.XX.X` in the commands below is a placeholder. Replace it with your real version, or the command fails with `No such file or directory`. Run `nvm which current` to get the full path.
+
+In an interactive SSH session NVM is already loaded, so the quickest test is to run it from the repository root, always passing the `.env` file:
+
+```bash
+cd /home/ec2-user/ec2-minecraft-scripts
+node --env-file=.env scripts/index.js
+```
+
+Without `--env-file`, the variables are not loaded and the script does not know which server directory or bucket to use.
+
+With Node.js 20.6.0 or later, using absolute paths (the same form the cron job uses):
 
 ```bash
 /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node \
@@ -284,7 +300,7 @@ set -a; . ./.env; set +a
 /home/ec2-user/.nvm/versions/node/vXX.XX.X/bin/node ./scripts/index.js
 ```
 
-On success, `stats.json` is uploaded or replaced at the root of the bucket. Errors are printed to the output and the script exits with a non-zero code.
+On success, it prints `Full stats uploaded successfully.` and `stats.json` is uploaded or replaced at the root of the bucket. Errors are printed to the output and the script exits with a non-zero code.
 
 ### Run automatically with cron
 
@@ -305,6 +321,62 @@ Cron runs with a limited environment, so use absolute paths everywhere. The scri
 ```bash
 sudo systemctl enable --now crond
 ```
+
+Common mistakes with the cron line:
+
+- Edit the crontab of `ec2-user` (`crontab -e`, **without** `sudo`). Root's crontab (`sudo crontab -e`) is only for `auto-shutdown.sh`.
+- The whole entry is a single line, with a space between the `.env` path and the `index.js` path.
+- Paste it inside `crontab -e`, never directly into the terminal: bash would try to run it.
+- Use your real Node.js path instead of `vXX.XX.X`.
+
+### Check the cron runs
+
+Each run appends one line to `sync.log`. To see the latest ones, or to follow them live:
+
+```bash
+tail -n 20 /home/ec2-user/ec2-minecraft-scripts/sync.log
+tail -f /home/ec2-user/ec2-minecraft-scripts/sync.log
+```
+
+A successful run looks like this, with a new line at every scheduled run:
+
+```
+[2026-01-01T12:00:01.123Z] Full stats uploaded successfully.
+```
+
+A failed run prints `Error syncing stats:` followed by the reason. If `sync.log` does not change, check whether cron launched the command:
+
+```bash
+sudo journalctl -u crond --since "10 minutes ago" | grep ec2-user
+```
+
+Confirm the upload by checking the `updatedAt` field of `stats.json` in the bucket. Responses may be cached for up to 5 minutes (`CacheControl: max-age=300`).
+
+To test the cron job quickly, temporarily use `*/2 * * * *`, check `sync.log`, and switch back to `*/15` afterwards. `sync.log` grows with every run; empty it when needed with `: > /home/ec2-user/ec2-minecraft-scripts/sync.log`.
+
+### Troubleshooting
+
+| Message in `sync.log` or terminal | Likely cause |
+| --- | --- |
+| `No such file or directory` for the `node` path | The `vXX.XX.X` placeholder was not replaced, or the version is wrong. Check with `nvm which current`. |
+| `.../.env/home/...: not found` | The space between the `.env` path and the `index.js` path is missing. |
+| `ENOENT ... usercache.json` | `MC_DIR` is missing or wrong in `.env` (use `/opt/minecraft/server`), or `.env` was not loaded with `--env-file`. |
+| `EACCES: permission denied` | `ec2-user` cannot read the server files, which belong to `minecraft`. Check with `ls -ld /opt/minecraft/server /opt/minecraft/server/world/stats`. |
+| `AccessDenied` | The instance role lacks `s3:PutObject` on `stats.json`, or `S3_BUCKET` / `AWS_REGION` are wrong. |
+| `Could not load credentials` | No IAM role is attached to the instance. |
+
+## Logs and useful commands
+
+| What | Command |
+| --- | --- |
+| Minecraft server log | `sudo journalctl -u minecraft -f` |
+| Server service status | `sudo systemctl status minecraft` |
+| Stats sync runs | `tail -f /home/ec2-user/ec2-minecraft-scripts/sync.log` |
+| Cron launched the stats job | `sudo journalctl -u crond --since "10 minutes ago" \| grep ec2-user` |
+| Your crontabs | `crontab -l` (`ec2-user`, stats) and `sudo crontab -l` (root, auto-shutdown) |
+| Auto-shutdown idle counter | `cat /tmp/mc_idle_count` |
+| Auto-shutdown triggered a shutdown | `sudo journalctl \| grep "Minecraft Auto-Shutdown"` |
+| World backups | `ls -lh /opt/minecraft/backups` |
 
 ## Updating the scripts
 
